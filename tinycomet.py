@@ -92,17 +92,12 @@ def wait_receiver(uuid, env, start_response):
     
     if 'since' in query:
         since = int(query['since'], 10)
-        timeout = int(query.get('timeout', '10'), 10)
-
+        timeout = float(query['timeout']) if 'timeout' in query else None
+        
         # wait for update
         with _update_lock:
             while data.last_update <= since:
-                wait = WAIT_INTERVAL if timeout > WAIT_INTERVAL else timeout
-                _update_lock.wait(wait)
-                timeout -= wait
-                if timeout < 0.01:
-                    # return timeout
-                    return error_response(start_response, 408)
+                _update_lock.wait(timeout)
     
     if data.finished:
         # remove from storage
