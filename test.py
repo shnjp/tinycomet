@@ -56,7 +56,7 @@ def test_timeout():
         
 def test_main():
     # launch comet server
-    th = threading.Thread(target=tinycomet.main)
+    th = threading.Thread(target=tinycomet.main, args=([],))
     th.daemon = True
     th.start()
     

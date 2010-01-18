@@ -6,6 +6,9 @@ from eventlet.corolocal import local
 import urllib
 import wsgiref
 import functools
+import time
+import json
+import binascii
 
 ERRORS = {
     400: 'Bad Request',
@@ -15,6 +18,9 @@ ERRORS = {
 WAIT_INTERVAL = 2.5
 _comet_storage = {}
 _update_lock = threading.Condition()
+
+class TimeoutException(Exception):
+    pass
 
 class LogicalTimer(object):
     def __init__(self):
@@ -38,12 +44,15 @@ class LogicalTimer(object):
 _logical_timer = LogicalTimer()
 
 class CometData(object):
-    def __init__(self):
-        self.payload = ''
-        self.content_type = 'application/octet-stream'
-        self.last_update = 0
-        self.finished = False
-
+    def __init__(self, payload, last_update, content_type='application/octet-stream', finished=False):
+        self.payload = payload
+        self.last_update = last_update
+        self.content_type = content_type
+        self.finished = finished
+    
+    def __repr__(self):
+        return '<CometData (%d):`%r`:%s>' % (self.last_update, self.payload, self.content_type)
+    
 def make_dispatch_middleware(urlmap):
     def app(env, start_response):
         path = env['PATH_INFO']
@@ -84,31 +93,65 @@ def make_comet_receiver(func):
 
 @make_comet_receiver
 def wait_receiver(uuid, env, start_response):
-    try:
-        data = _comet_storage[uuid]
-    except KeyError:
-        return error_response(start_response, 404)
     query = parse_query(env)
     
-    if 'since' in query:
-        since = int(query['since'], 10)
+    since = int(query['since'], 10) if 'since' in query else None
+    if since:
         timeout = float(query['timeout']) if 'timeout' in query else None
-        
-        # wait for update
-        with _update_lock:
-            while data.last_update <= since:
-                _update_lock.wait(timeout)
+        last = time.time() + timeout if timeout else None
     
+    try:
+        # もっと綺麗にかけないかしら
+        with _update_lock:
+            while True:
+                data = _comet_storage[uuid]
+                if not since or data.last_update > since:
+                    break
+                
+                # wait for update
+                _update_lock.wait(timeout)
+                timeout = last - time.time() if last else None
+                if timeout is not None and timeout < 0:
+                    raise TimeoutException
+    except KeyError:
+        return error_response(start_response, 404)
+    except TimeoutException:
+        return error_response(start_response, 408)
+
     if data.finished:
         # remove from storage
         del _comet_storage[uuid]
-                
+
+    jsonp = query.get('callback')
+    
     headers = [
-        ('Content-Type', data.content_type),
         ('X-TC-Timestamp', '%d' % data.last_update)
     ]
-    start_response('200 OK', headers)
-    return [data.payload]
+    
+    if jsonp is None:
+        headers.append(('Content-Type', data.content_type))
+        if data.finished:
+            headers.append(('X-TC-Removed', 'removed'))
+
+        start_response('200 OK', headers)
+        return [data.payload]
+    else:
+        obj = {
+            'last_update': data.last_update,
+            'content_type': data.content_type,
+            'finished': data.finished
+        }
+        if data.content_type in ['application/json']:
+            obj['payload'] = json.loads(data.payload)
+        elif data.content_type.startswith('text/'):
+            obj['payload_text'] = data.payload
+        else:
+            obj['payload_base64'] = binascii.b2a_base64(data.payload)
+        headers.append(('Content-Type', 'text/javascript'))
+        print json.dumps(obj)
+        start_response('200 OK', headers)
+        return [jsonp, '(', json.dumps(obj), ')']
+        
 
 @make_comet_receiver
 def update_receiver(uuid, env, start_response):
@@ -116,21 +159,19 @@ def update_receiver(uuid, env, start_response):
         return error_response(start_response, 400)
     query = parse_query(env)
     
-    data = _comet_storage.setdefault(uuid, CometData())
-    data.payload = env['wsgi.input'].read()
-    data.last_update = _logical_timer.get_local()
-    data.content_type = query.get('content_type', 'application/octet-stream')
-    
-    if query.get('finished', '') == '1':
-        # finished
-        data.finished = True
-    
+    last_update = _logical_timer.get_local()
     with _update_lock:
+        _comet_storage[uuid] = CometData(
+            env['wsgi.input'].read(),
+            last_update,
+            content_type=query.get('content_type', 'application/octet-stream'),
+            finished=query.get('finished', '') == '1'
+        )
         _update_lock.notify_all()
 
     headers = [
 #        ('Content-Type', data.content_type),
-        ('X-TC-Timestamp', '%d' % data.last_update)
+        ('X-TC-Timestamp', '%d' % last_update)
     ]
     
     start_response('201 Created', headers)
